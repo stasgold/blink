@@ -61,12 +61,23 @@ jobs:
       - name: App Store Connect API key
         env:
           ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
-        # Rebuild the PEM from its base64 body, in case it was pasted without line breaks.
+        # Rebuild the PEM from its base64 body. A key pasted on a phone can lose its line
+        # breaks, and smart punctuation can turn the ----- around BEGIN/END into dashes.
         run: |
           python3 - <<'PY'
-          import os, re, textwrap
-          body = re.sub(r"-----(BEGIN|END) PRIVATE KEY-----", "", os.environ["ASC_KEY_P8"])
+          import base64, os, re, textwrap
+          raw = os.environ["ASC_KEY_P8"]
+          body = re.sub(r"(BEGIN|END)\s*PRIVATE\s*KEY", "", raw, flags=re.I)
           body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+          try:
+              der = base64.b64decode(body + "=" * (-len(body) % 4))
+          except Exception as e:
+              der = b""
+          # Shape only, never the key itself: an App Store Connect key is ~200 base64
+          # characters decoding to 138 bytes that start with 0x30 (an ASN.1 sequence).
+          print(f"pasted {len(raw)} chars, {raw.count(chr(10))} line breaks, "
+                f"non-ASCII {sum(ord(c) > 127 for c in raw)}; body {len(body)} chars -> "
+                f"{len(der)} bytes, first byte {der[:1].hex() or 'none'}")
           pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(textwrap.wrap(body, 64)) + "\n-----END PRIVATE KEY-----\n"
           open(os.path.join(os.environ["RUNNER_TEMP"], "AuthKey.p8"), "w").write(pem)
           PY
