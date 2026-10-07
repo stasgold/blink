@@ -117,11 +117,17 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build
+          # Upstream leaves the extensions on an older version than the app, which App Store
+          # Connect flags (ITMS-90473); give every target the app's version.
+          VERSION=$(xcodebuild -project Blink.xcodeproj -target Blink -configuration Release -showBuildSettings 2>/dev/null \
+            | awk '$1 == "MARKETING_VERSION" { print $3 }')
+          echo "version $VERSION"
           xcodebuild archive -project Blink.xcodeproj -scheme Blink \
             -configuration Release -destination 'generic/platform=iOS' \
             -archivePath build/Blink.xcarchive \
             DEVELOPMENT_TEAM=${{ secrets.TEAM_ID }} \
             CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            MARKETING_VERSION="$VERSION" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
             -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
