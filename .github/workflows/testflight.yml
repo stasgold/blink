@@ -73,13 +73,43 @@ jobs:
               der = base64.b64decode(body + "=" * (-len(body) % 4))
           except Exception as e:
               der = b""
-          # Shape only, never the key itself: an App Store Connect key is ~200 base64
-          # characters decoding to 138 bytes that start with 0x30 (an ASN.1 sequence).
+          # Shape only, never the key itself: an App Store Connect key is 200 base64
+          # characters decoding to 150 bytes that start with 0x30 (an ASN.1 sequence).
           print(f"pasted {len(raw)} chars, {raw.count(chr(10))} line breaks, "
                 f"non-ASCII {sum(ord(c) > 127 for c in raw)}; body {len(body)} chars -> "
                 f"{len(der)} bytes, first byte {der[:1].hex() or 'none'}")
           pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(textwrap.wrap(body, 64)) + "\n-----END PRIVATE KEY-----\n"
           open(os.path.join(os.environ["RUNNER_TEMP"], "AuthKey.p8"), "w").write(pem)
+          PY
+
+      - name: Check API key with Apple
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        # One read-only request, so a rejected key fails here with Apple's own reason
+        # instead of as a signing error. Prints a short fingerprint, never the key.
+        run: |
+          pip3 install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'PY'
+          import hashlib, json, os, time, urllib.error, urllib.request
+          import jwt
+          from cryptography.hazmat.primitives import serialization
+          pem = open(os.path.join(os.environ["RUNNER_TEMP"], "AuthKey.p8"), "rb").read()
+          key = serialization.load_pem_private_key(pem, password=None)
+          pub = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+          kid, iss = os.environ["ASC_KEY_ID"], os.environ["ASC_ISSUER_ID"]
+          print(f"key id {kid!r} ({len(kid)} chars), issuer {len(iss)} chars, public key fingerprint {hashlib.sha256(pub).hexdigest()[:12]}")
+          now = int(time.time())
+          token = jwt.encode({"iss": iss, "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+                             key, algorithm="ES256", headers={"kid": kid, "typ": "JWT"})
+          req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/apps?limit=1",
+                                       headers={"Authorization": f"Bearer {token}"})
+          try:
+              with urllib.request.urlopen(req) as r:
+                  print("Apple accepted the key:", r.status)
+          except urllib.error.HTTPError as e:
+              print("Apple rejected the key:", e.code, json.loads(e.read())["errors"][0].get("detail"))
+              raise SystemExit(1)
           PY
 
       - name: Archive
