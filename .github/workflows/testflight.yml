@@ -1,0 +1,118 @@
+name: TestFlight
+
+# Personal build of Blink, signed with our own team and uploaded to TestFlight.
+# Capabilities a personal team cannot get without Apple's approval or extra setup
+# (default-browser, iCloud, push, associated domains) are stripped before signing.
+on:
+  workflow_dispatch:
+  push:
+    branches: [testflight]
+
+concurrency:
+  group: testflight
+  cancel-in-progress: true
+
+env:
+  BUNDLE_ID: com.stasgold.blink
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Frameworks and resources
+        run: |
+          ./get_frameworks.sh
+          ./get_resources.sh
+          rm -rf Blink.xcodeproj/project.xcworkspace/xcshareddata/
+
+      - name: Developer settings
+        run: |
+          sed -e "s/^TEAM_ID = .*/TEAM_ID = ${{ secrets.TEAM_ID }}/" \
+              -e "s/^BUNDLE_ID = .*/BUNDLE_ID = $BUNDLE_ID/" \
+              -e "s/^GROUP_ID  = .*/GROUP_ID  = $BUNDLE_ID/" \
+              -e "s/^CLOUD_ID = .*/CLOUD_ID = $BUNDLE_ID/" \
+              -e "s/^KEYCHAIN_ID1 = .*/KEYCHAIN_ID1 = $BUNDLE_ID/" \
+              template_setup.xcconfig > developer_setup.xcconfig
+          grep -E '^(TEAM_ID|BUNDLE_ID|GROUP_ID|CLOUD_ID|KEYCHAIN_ID1) ' developer_setup.xcconfig
+
+      - name: Strip capabilities
+        run: |
+          E=Blink/Blink.entitlements
+          for key in aps-environment \
+                     com.apple.developer.associated-domains \
+                     com.apple.developer.icloud-container-identifiers \
+                     com.apple.developer.icloud-services \
+                     com.apple.developer.ubiquity-container-identifiers \
+                     com.apple.developer.ubiquity-kvstore-identifier \
+                     com.apple.developer.web-browser; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$E" || true
+          done
+          plutil -p "$E"
+
+      - name: App Store Connect API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        # Rebuild the PEM from its base64 body, in case it was pasted without line breaks.
+        run: |
+          python3 - <<'PY'
+          import os, re, textwrap
+          body = re.sub(r"-----(BEGIN|END) PRIVATE KEY-----", "", os.environ["ASC_KEY_P8"])
+          body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+          pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(textwrap.wrap(body, 64)) + "\n-----END PRIVATE KEY-----\n"
+          open(os.path.join(os.environ["RUNNER_TEMP"], "AuthKey.p8"), "w").write(pem)
+          PY
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild archive -project Blink.xcodeproj -scheme Blink \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/Blink.xcarchive \
+            DEVELOPMENT_TEAM=${{ secrets.TEAM_ID }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }} \
+            | tee build/archive.log | grep -E 'error:|warning: .*provisioning|\*\* ARCHIVE' || true
+          test -d build/Blink.xcarchive
+
+      - name: Upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/Blink.xcarchive \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }}
+
+      - name: Archive log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-log
+          path: build/archive.log
+
+      - name: Remove API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
