@@ -13,7 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUNDLE_ID: com.stasgold.blink
+  BUNDLE_ID: com.stasgold.blinkshell
+  GROUP_ID: com.stasgold.blink
 
 jobs:
   build:
@@ -38,9 +39,9 @@ jobs:
         run: |
           sed -e "s/^TEAM_ID = .*/TEAM_ID = ${{ secrets.TEAM_ID }}/" \
               -e "s/^BUNDLE_ID = .*/BUNDLE_ID = $BUNDLE_ID/" \
-              -e "s/^GROUP_ID  = .*/GROUP_ID  = $BUNDLE_ID/" \
+              -e "s/^GROUP_ID  = .*/GROUP_ID  = $GROUP_ID/" \
               -e "s/^CLOUD_ID = .*/CLOUD_ID = $BUNDLE_ID/" \
-              -e "s/^KEYCHAIN_ID1 = .*/KEYCHAIN_ID1 = $BUNDLE_ID/" \
+              -e "s/^KEYCHAIN_ID1 = .*/KEYCHAIN_ID1 = $GROUP_ID/" \
               template_setup.xcconfig > developer_setup.xcconfig
           grep -E '^(TEAM_ID|BUNDLE_ID|GROUP_ID|CLOUD_ID|KEYCHAIN_ID1) ' developer_setup.xcconfig
 
