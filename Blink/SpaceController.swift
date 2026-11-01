@@ -1269,8 +1269,13 @@ extension SpaceController: SnippetContext {
 // MARK: SceneIntent handlers
 extension SpaceController {
   @objc func runShellSessionIntent(command: String = "") {
-    DispatchQueue.main.sync {
-      self._newShellAction(command: command)
+    // Callers (menu actions, URL handlers) are already on main; main.sync from main traps.
+    if Thread.isMainThread {
+      _newShellAction(command: command)
+    } else {
+      DispatchQueue.main.async {
+        self._newShellAction(command: command)
+      }
     }
   }
 
