@@ -1,0 +1,166 @@
+name: TestFlight
+
+# Personal build of Blink, signed with our own team and uploaded to TestFlight.
+# Capabilities a personal team cannot get without Apple's approval or extra setup
+# (default-browser, iCloud, push, associated domains) are stripped before signing.
+on:
+  workflow_dispatch:
+  push:
+    branches: [testflight]
+
+concurrency:
+  group: testflight
+  cancel-in-progress: true
+
+env:
+  BUNDLE_ID: com.stasgold.blinkshell
+  GROUP_ID: com.stasgold.blink
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Frameworks and resources
+        run: |
+          ./get_frameworks.sh
+          ./get_resources.sh
+          rm -rf Blink.xcodeproj/project.xcworkspace/xcshareddata/
+
+      - name: Developer settings
+        run: |
+          sed -e "s/^TEAM_ID = .*/TEAM_ID = ${{ secrets.TEAM_ID }}/" \
+              -e "s/^BUNDLE_ID = .*/BUNDLE_ID = $BUNDLE_ID/" \
+              -e "s/^GROUP_ID  = .*/GROUP_ID  = $GROUP_ID/" \
+              -e "s/^CLOUD_ID = .*/CLOUD_ID = $BUNDLE_ID/" \
+              -e "s/^KEYCHAIN_ID1 = .*/KEYCHAIN_ID1 = $GROUP_ID/" \
+              template_setup.xcconfig > developer_setup.xcconfig
+          grep -E '^(TEAM_ID|BUNDLE_ID|GROUP_ID|CLOUD_ID|KEYCHAIN_ID1) ' developer_setup.xcconfig
+
+      - name: Strip capabilities
+        run: |
+          E=Blink/Blink.entitlements
+          for key in aps-environment \
+                     com.apple.developer.associated-domains \
+                     com.apple.developer.icloud-container-identifiers \
+                     com.apple.developer.icloud-services \
+                     com.apple.developer.ubiquity-container-identifiers \
+                     com.apple.developer.ubiquity-kvstore-identifier \
+                     com.apple.developer.web-browser; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$E" || true
+          done
+          plutil -p "$E"
+
+      - name: App Store Connect API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        # Rebuild the PEM from its base64 body. A key pasted on a phone can lose its line
+        # breaks, and smart punctuation can turn the ----- around BEGIN/END into dashes.
+        run: |
+          python3 - <<'PY'
+          import base64, os, re, textwrap
+          raw = os.environ["ASC_KEY_P8"]
+          body = re.sub(r"(BEGIN|END)\s*PRIVATE\s*KEY", "", raw, flags=re.I)
+          body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+          try:
+              der = base64.b64decode(body + "=" * (-len(body) % 4))
+          except Exception as e:
+              der = b""
+          # Shape only, never the key itself: an App Store Connect key is 200 base64
+          # characters decoding to 150 bytes that start with 0x30 (an ASN.1 sequence).
+          print(f"pasted {len(raw)} chars, {raw.count(chr(10))} line breaks, "
+                f"non-ASCII {sum(ord(c) > 127 for c in raw)}; body {len(body)} chars -> "
+                f"{len(der)} bytes, first byte {der[:1].hex() or 'none'}")
+          pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(textwrap.wrap(body, 64)) + "\n-----END PRIVATE KEY-----\n"
+          open(os.path.join(os.environ["RUNNER_TEMP"], "AuthKey.p8"), "w").write(pem)
+          PY
+
+      - name: Check API key with Apple
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        # One read-only request, so a rejected key fails here with Apple's own reason
+        # instead of as a signing error. Prints a short fingerprint, never the key.
+        run: |
+          pip3 install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'PY'
+          import hashlib, json, os, time, urllib.error, urllib.request
+          import jwt
+          from cryptography.hazmat.primitives import serialization
+          pem = open(os.path.join(os.environ["RUNNER_TEMP"], "AuthKey.p8"), "rb").read()
+          key = serialization.load_pem_private_key(pem, password=None)
+          pub = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+          kid, iss = os.environ["ASC_KEY_ID"], os.environ["ASC_ISSUER_ID"]
+          print(f"key id {kid!r} ({len(kid)} chars), issuer {len(iss)} chars, public key fingerprint {hashlib.sha256(pub).hexdigest()[:12]}")
+          now = int(time.time())
+          token = jwt.encode({"iss": iss, "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+                             key, algorithm="ES256", headers={"kid": kid, "typ": "JWT"})
+          req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/apps?limit=1",
+                                       headers={"Authorization": f"Bearer {token}"})
+          try:
+              with urllib.request.urlopen(req) as r:
+                  print("Apple accepted the key:", r.status)
+          except urllib.error.HTTPError as e:
+              print("Apple rejected the key:", e.code, json.loads(e.read())["errors"][0].get("detail"))
+              raise SystemExit(1)
+          PY
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          mkdir -p build
+          # Upstream leaves the extensions on an older version than the app, which App Store
+          # Connect flags (ITMS-90473); give every target the app's version.
+          VERSION=$(xcodebuild -project Blink.xcodeproj -target Blink -configuration Release -showBuildSettings 2>/dev/null \
+            | awk '$1 == "MARKETING_VERSION" { print $3 }')
+          echo "version $VERSION"
+          xcodebuild archive -project Blink.xcodeproj -scheme Blink \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/Blink.xcarchive \
+            DEVELOPMENT_TEAM=${{ secrets.TEAM_ID }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            MARKETING_VERSION="$VERSION" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }} \
+            | tee build/archive.log | grep -E 'error:|warning: .*provisioning|\*\* ARCHIVE' || true
+          test -d build/Blink.xcarchive
+
+      - name: Upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/Blink.xcarchive \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }}
+
+      - name: Archive log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-log
+          path: build/archive.log
+
+      - name: Remove API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
